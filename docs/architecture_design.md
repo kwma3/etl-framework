@@ -29,6 +29,9 @@ This document defines the production architectural design for an extensible, ser
 
 ## 2. High-Level Architecture Diagram
 
+> [!NOTE]
+> An interactive, presentation-ready component diagram is saved at [architecture_diagram.html](file:///Users/kenny/projects/etl_framework/docs/architecture_diagram.html).
+
 ```mermaid
 flowchart TD
     Trigger["Trigger: EventBridge Rule / CLI / API"] -->|Payload: job_name, parameters| SFN["Step Functions State Machine (ASL)"]
@@ -321,3 +324,36 @@ Query all historical job runs and statuses from DynamoDB:
 ```bash
 make query-ddb
 ```
+
+---
+
+## 8. Architectural Comparison: Serverless Framework vs. Apache Airflow
+
+The table below contrasts this serverless framework (Step Functions + Lambda Dispatcher + S3 Data Pointer Pattern + DynamoDB) against traditional Apache Airflow (self-hosted or managed via AWS MWAA / Astronomer):
+
+### 8.1. Comparison Matrix
+
+| Dimension | This Framework (Step Functions + Lambda) | Apache Airflow (Self-Hosted / MWAA) |
+| :--- | :--- | :--- |
+| **Infrastructure & Ops** | ✅ **Serverless**: Zero server/cluster management. AWS manages scheduling, scaling, and state persistence natively. | **Cluster-based**: Requires Scheduler, Webserver, Metadata DB (PostgreSQL), and Worker pool (Celery/K8s/ECS). |
+| **Idle Cost** | ✅ **\$0.00**: 100% pay-per-invocation (Lambda ms, Step Functions state transitions, DynamoDB on-demand). | **High baseline**: AWS MWAA starts at `~$350+/month` idle; self-hosted requires running EC2/EKS nodes 24/7. |
+| **Scaling & Latency** | ✅ **Instant & Event-Driven**: Sub-second trigger via EventBridge/API; auto-scales to 1,000s of concurrent workers. | **Batch & Polling-based**: Scheduler evaluates DAG loops (seconds to minutes latency). Poor fit for real-time/streaming. |
+| **Execution Limits** | **Hard Constraints**: 15-minute Lambda timeout, 10 GB RAM, 10 GB `/tmp`, 256 KB SFN state payload limit. | ✅ **Unconstrained**: Tasks can run for hours/days with arbitrary memory, disk, or GPU resources (e.g., via `KubernetesPodOperator`). |
+| **DAG Definition** | **Hybrid / ASL**: Python `@register_job` for standard 3-task jobs; bespoke branching requires Amazon States Language (ASL) / Terraform. | ✅ **Pure Python DAGs**: Infinite programmatic flexibility (dynamic DAG generation, complex task branching, task groups). |
+| **Ecosystem & Connectors** | **Lightweight / Custom**: Custom Python classes using `boto3` or direct client libraries. | ✅ **Massive Ecosystem**: Hundreds of pre-built provider packages (Snowflake, Databricks, BigQuery, dbt, Trino, Slack). |
+| **Backfilling & Time-Travel** | **Manual**: Triggered via CLI/EventBridge script with custom date parameters. | ✅ **First-Class Primitive**: Native data interval backfilling (`catchup=True`, historical execution dates). |
+| **Failure Recovery** | ✅ **Step Functions Redrive**: Native 1-click rerun from failed task; DynamoDB state checkpointing. | **Task / DAG Clear**: Rerun individual failed tasks, downstream tasks, or entire DAG runs from the UI. |
+
+### 8.2. Decision Framework
+
+- **Choose this Serverless Design when:**
+  - Tasks complete within the **15-minute Lambda window** with moderate compute/memory requirements.
+  - Workloads are **event-driven** (e.g., triggering immediately upon S3 upload or webhook event) or bursty micro-batches.
+  - Minimizing operational overhead and eliminating idle infrastructure costs (\$0 idle cost) are key priorities.
+  - You operate primarily within the AWS ecosystem.
+
+- **Choose Apache Airflow when:**
+  - Workloads require **long-running computations** (e.g., multi-hour PySpark/EMR jobs, heavy dbt runs against warehouses).
+  - You have **complex, multi-tier DAG topologies** with dynamic task generation and cross-pipeline dependencies.
+  - You need **native historical backfilling** over arbitrary calendar intervals and enterprise metadata/lineage integration (OpenLineage, Marquez).
+
