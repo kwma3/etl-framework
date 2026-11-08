@@ -23,14 +23,11 @@ output "eventbridge_rule_name" {
   value       = aws_cloudwatch_event_rule.etl_trigger_rule.name
 }
 
-output "lambda_extract_name" {
-  value = aws_lambda_function.extract.function_name
+output "lambda_dispatcher_name" {
+  value = aws_lambda_function.etl_dispatcher.function_name
 }
 
-output "lambda_transform_name" {
-  value = aws_lambda_function.transform.function_name
-}
-
-output "lambda_load_name" {
-  value = aws_lambda_function.load.function_name
+output "cloudwatch_dashboard_name" {
+  description = "Name of the CloudWatch monitoring dashboard"
+  value       = aws_cloudwatch_dashboard.etl_dashboard.dashboard_name
 }

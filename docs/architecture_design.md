@@ -1,17 +1,29 @@
 # Serverless Python ETL Framework: Architecture & Design
 
-## 1. Executive Summary & Objectives
+## 1. Executive Summary & Core Decisions
 
-This document defines the architectural design for a simplified, extensible, Python-native ETL framework deployed on AWS serverless infrastructure (emulated locally via LocalStack).
+This document defines the production architectural design for an extensible, serverless Python ETL framework deployed on AWS (and emulated locally on LocalStack).
 
-### Primary Goals
+### Key Architectural Decisions
 
-1. **Python-Centric Developer Experience**: Data engineers write standard Python classes for jobs and tasks with clean abstractions.
-2. **Simplified Infrastructure**: A single **Unified Lambda Runner** hosts and executes all registered ETL jobs, eliminating the complexity and deployment overhead of micro-lambdas per task.
-3. **Pluggable Job Registry**: New ETL jobs are declared, decorated (`@register_job`), and dynamically discovered at runtime without modifying infrastructure code.
-4. **Task-Composed Workflows**: A job is composed of discrete, reusable `ETLTask` units (e.g., Extract, Transform, Validate, Load) executed sequentially within the Lambda execution context.
-5. **Auditing & State Persistence**: Comprehensive lifecycle tracking in DynamoDB with automated S3 storage partitioning for raw and processed datasets.
-6. **Concurrent & Isolated**: Native horizontal auto-scaling where concurrent jobs run in separate Lambda execution sandboxes with zero state leakage.
+1. **Step Functions as Workflow Orchestrator**:
+   - Every task in a job is represented as an explicit state in an **Amazon States Language (ASL)** state machine.
+   - Provides granular visual execution history in the AWS / LocalStack web console.
+   - Enables native **1-Click Redrive**: If any task fails, engineers can click "Redrive" directly in the management console to restart execution from the failed task without re-running earlier tasks.
+   - Handles multi-job dependencies, branching, parallel fan-out, and failure catches natively.
+
+2. **Unified Task Dispatcher Lambda (No Micro-Lambda Sprawl)**:
+   - Instead of deploying separate AWS Lambda functions for each step, a **single unified Lambda function** hosts the framework, task runner, and all registered job classes.
+   - Step Functions invokes this unified dispatcher with `{ "job_name": "...", "task_name": "..." }`.
+
+3. **In-Memory Job Registry with Auto-Discovery**:
+   - Jobs are written as standard Python classes decorated with `@register_job("job_name")`.
+   - Jobs are automatically discovered and loaded into memory on container startup via Python's package inspection.
+
+4. **Stateless Compute with S3 Pointers & DynamoDB Auditing**:
+   - Step Functions passes lightweight metadata pointers (`job_id`, `raw_s3_key`, `processed_s3_key`) to remain well below the 256 KB Step Functions payload limit.
+   - Data payloads are persisted directly to S3 partitioned by `job_id`.
+   - Lifecycle state and execution metrics are recorded in DynamoDB under on-demand billing.
 
 ---
 
@@ -19,183 +31,293 @@ This document defines the architectural design for a simplified, extensible, Pyt
 
 ```mermaid
 flowchart TD
-    Trigger["Trigger: EventBridge / CLI / Step Functions"] -->|Payload: job_name, parameters| Runner["Unified ETL Runner Lambda"]
+    Trigger["Trigger: EventBridge Rule / CLI / API"] -->|Payload: job_name, parameters| SFN["Step Functions State Machine (ASL)"]
 
-    subgraph RunnerEnvironment["Lambda Execution Sandbox (Per Job Run)"]
-        Registry["Job Registry Catalog"] -->|Lookup job_name| JobInstance["Instantiate ETLJob"]
-        JobInstance --> Context["Initialize ETLContext (job_id, parameters)"]
+    subgraph StepFunctionsWorkflow["Step Functions State Machine (Console Visual Tracking & Redrive)"]
+        ExtractState["State 1: ExtractTask"] -->|Success| TransformState["State 2: TransformTask"]
+        TransformState -->|Success| LoadState["State 3: LoadTask"]
         
-        subgraph TaskExecutionWorkflow["Sequential Task Pipeline"]
-            Context --> Task1["Task 1: Extract Task"]
-            Task1 -->|Updated Context| Task2["Task 2: Transform Task"]
-            Task2 -->|Updated Context| Task3["Task 3: Load & Validate Task"]
-        end
+        ExtractState -.->|Catch Fail| FailedState["State: PipelineFailed"]
+        TransformState -.->|Catch Fail| FailedState
+        TransformState -.->|🔄 1-Click Redrive| TransformState
+        LoadState -.->|Catch Fail| FailedState
     end
 
-    Task1 -.->|Raw JSON / CSV| S3Raw[("S3: Raw Bucket<br/>raw/{job_id}/...")]
-    Task2 -.->|Transformed Data| S3Processed[("S3: Processed Bucket<br/>processed/{job_id}/...")]
-    
-    TaskExecutionWorkflow -->|Audit Trail & Metrics| DynamoDB[("DynamoDB: Metadata Table<br/>PK: job_id | SK: timestamp")]
-    TaskExecutionWorkflow -->|Completion Event| EventBridgeBus["EventBridge Event Bus<br/>etl.framework.completed"]
+    SFN -->|Invoke: task_name=extract| Dispatcher["Unified Task Dispatcher Lambda"]
+    SFN -->|Invoke: task_name=transform| Dispatcher
+    SFN -->|Invoke: task_name=load| Dispatcher
+
+    subgraph LambdaRuntime["Unified Dispatcher Lambda (Python 3.11)"]
+        Registry["Job Registry Catalog"] -->|Lookup job_name| Job["Instantiate ETLJob"]
+        Job --> Task["Lookup task_name -> ETLTask"]
+        Task --> Context["Execute task with ETLContext"]
+    end
+
+    Context -.->|Raw JSON / CSV| S3Raw[("S3: Raw Bucket<br/>raw/{job_id}/...")]
+    Context -.->|Cleaned Data| S3Processed[("S3: Processed Bucket<br/>processed/{job_id}/...")]
+    Context -->|Task State & Heartbeat| DynamoDB[("DynamoDB: Metadata Table<br/>PK: job_id | SK: timestamp")]
 ```
 
 ---
 
-## 3. Core Framework Abstractions
+## 3. Amazon States Language (ASL) Specification
 
-The framework is organized into five decoupled abstractions:
+The state machine is defined in Amazon States Language in `terraform/asl/etl_pipeline.asl.json` and provisioned via Terraform:
 
-```
-src/
-├── framework/
-│   ├── base.py          # Abstract ETLTask & ETLJob definitions
-│   ├── context.py       # Runtime ETLContext & AWS service adapters
-│   ├── registry.py      # Job catalog & @register_job decorator
-│   └── runner.py        # Lifecycle orchestration, error handling, and auditing
-├── jobs/                # User-defined ETL jobs
-│   ├── customer_orders.py
-│   └── user_metrics.py
-└── lambda_runner.py     # Main AWS Lambda entrypoint
-```
-
-### 3.1. `ETLContext` (Runtime Environment)
-An instance of `ETLContext` is created for each execution and passed down through each task:
-- **Metadata**: Carries `job_id`, `job_name`, `parameters`, and `start_time`.
-- **Inter-Task State**: Provides `context.set(key, value)` and `context.get(key)` for passing intermediate data in-memory between tasks.
-- **Storage Helpers**:
-  - `context.save_s3(key, data, bucket_type="raw"|"processed")`
-  - `context.read_s3(key, bucket_type="raw"|"processed")`
-- **Metrics**: Allows recording task-level statistics (`context.record_metric("rows_processed", 120)`).
-
-### 3.2. `ETLTask` (Atomic Unit of Work)
-Every discrete step inherits from `ETLTask`:
-```python
-class ETLTask:
-    name: str = "task_name"
-    
-    def execute(self, context: ETLContext) -> Any:
-        """Executes the task logic using the provided context."""
-        raise NotImplementedError
-```
-
-### 3.3. `ETLJob` (Workflow Pipeline)
-A job encapsulates metadata and an ordered sequence of tasks:
-```python
-class ETLJob:
-    name: str
-    description: str = ""
-    tasks: list[ETLTask] = []
-```
-
-### 3.4. `JobRegistry` (Dynamic Discovery)
-Jobs register themselves via a decorator:
-```python
-@register_job("customer_orders")
-class CustomerOrdersJob(ETLJob):
-    description = "Ingests customer transactions, cleans currencies, and aggregates totals"
-    tasks = [ExtractOrdersTask(), CleanseOrdersTask(), LoadSummaryTask()]
-```
-The registry enables:
-- Looking up a job by string identifier (`JobRegistry.get("customer_orders")`).
-- Discovering all available jobs (`JobRegistry.list_jobs()`).
-
-### 3.5. `JobRunner` (Lifecycle & Auditing Manager)
-The runner executes a job end-to-end:
-1. Generates a unique `job_id` (UUID).
-2. Writes an initial `PENDING` / `IN_PROGRESS` record to DynamoDB.
-3. Loops through each task in `job.tasks`:
-   - Records task start timestamp.
-   - Executes `task.execute(context)`.
-   - Records task duration, status, and task-specific metrics.
-4. **Error Handling**: If an unhandled exception occurs in any task:
-   - Captures the exact exception type and formatted stack trace.
-   - Marks the job and failing task as `FAILED` in DynamoDB.
-   - Re-raises or exits cleanly with error details.
-5. **Success Finalization**: Marks the job as `COMPLETED` in DynamoDB and publishes an `ETLJobCompleted` event to EventBridge.
-
----
-
-## 4. Invocation & Event Interfaces
-
-The single Lambda handler accepts standardized JSON payloads from any trigger source (EventBridge rules, Step Functions, or direct SDK invocations):
-
-### Triggering an ETL Job
 ```json
 {
-  "job_name": "customer_orders",
-  "parameters": {
-    "date_range": "2026-11-01",
-    "batch_size": 500,
-    "dry_run": false
+  "Comment": "Serverless ETL Pipeline orchestrated by Step Functions with Unified Task Dispatcher",
+  "StartAt": "ExtractTask",
+  "States": {
+    "ExtractTask": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_arn}",
+        "Payload": {
+          "job_name.$": "$.job_name",
+          "task_name": "extract",
+          "job_id.$": "$.job_id",
+          "parameters.$": "$.parameters",
+          "context.$": "$.context"
+        }
+      },
+      "ResultSelector": {
+        "statusCode.$": "$.Payload.statusCode",
+        "job_id.$": "$.Payload.job_id",
+        "job_name.$": "$.Payload.job_name",
+        "task_name.$": "$.Payload.task_name",
+        "parameters.$": "$.Payload.parameters",
+        "context.$": "$.Payload.context",
+        "metrics.$": "$.Payload.metrics"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "TransformTask"
+    },
+    "TransformTask": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_arn}",
+        "Payload": {
+          "job_name.$": "$.job_name",
+          "task_name": "transform",
+          "job_id.$": "$.job_id",
+          "parameters.$": "$.parameters",
+          "context.$": "$.context"
+        }
+      },
+      "ResultSelector": {
+        "statusCode.$": "$.Payload.statusCode",
+        "job_id.$": "$.Payload.job_id",
+        "job_name.$": "$.Payload.job_name",
+        "task_name.$": "$.Payload.task_name",
+        "parameters.$": "$.Payload.parameters",
+        "context.$": "$.Payload.context",
+        "metrics.$": "$.Payload.metrics"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "LoadTask"
+    },
+    "LoadTask": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_arn}",
+        "Payload": {
+          "job_name.$": "$.job_name",
+          "task_name": "load",
+          "job_id.$": "$.job_id",
+          "parameters.$": "$.parameters",
+          "context.$": "$.context",
+          "is_final": true
+        }
+      },
+      "ResultSelector": {
+        "statusCode.$": "$.Payload.statusCode",
+        "job_id.$": "$.Payload.job_id",
+        "job_name.$": "$.Payload.job_name",
+        "task_name.$": "$.Payload.task_name",
+        "context.$": "$.Payload.context",
+        "metrics.$": "$.Payload.metrics"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "End": true
+    },
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Cause": "ETL Task Execution Failed",
+      "Error": "ETLTaskExecutionError"
+    }
   }
 }
 ```
 
-### Listing Registered Jobs
-```json
-{
-  "action": "list_jobs"
-}
-```
+---
+
+## 4. Single ASL vs. Dedicated ASLs
+
+The framework supports two ASL operational models:
+
+1. **One Generic ASL for Standard Jobs (Default)**:
+   - Because `"job_name.$": "$.job_name"` is passed dynamically in the ASL parameters, any job matching the standard 3-task pattern (`extract` ➔ `transform` ➔ `load`) runs on the **same single Step Functions state machine**.
+   - Adding new standard jobs in Python requires **zero Terraform changes**.
+
+2. **Dedicated ASL per Bespoke Job**:
+   - For jobs that require unique, non-linear workflows (parallel branches, `Choice` condition states, or different task names), a dedicated `<job_name>.asl.json` file is placed in `terraform/asl/`.
+   - All state machines invoke the **same single Lambda dispatcher**.
 
 ---
 
-## 5. Concurrency & Scaling Architecture (Without SQS)
-
-Without introducing SQS queues, the framework relies on native serverless horizontal scaling:
+## 5. Core Python Framework Abstractions
 
 ```
-Incoming Concurrency (e.g. 100 Jobs Triggered at 12:00:00)
-    │
-    ├── Job A, Run 1 ──► Lambda Instance 1 (job_id: job-a1) ──► S3 (raw/job-a1/...) ──► DynamoDB (PK: job-a1)
-    ├── Job A, Run 2 ──► Lambda Instance 2 (job_id: job-a2) ──► S3 (raw/job-a2/...) ──► DynamoDB (PK: job-a2)
-    ├── Job B, Run 1 ──► Lambda Instance 3 (job_id: job-b1) ──► S3 (raw/job-b1/...) ──► DynamoDB (PK: job-b1)
-    └── Job C, Run 1 ──► Lambda Instance 4 ──► ...
+src/
+├── framework/
+│   ├── __init__.py
+│   ├── base.py          # ETLTask & ETLJob abstract classes
+│   ├── context.py       # ETLContext runtime & AWS S3/DynamoDB adapters
+│   ├── registry.py      # In-memory JobRegistry catalog & @register_job decorator
+│   └── dispatcher.py    # Dispatches task calls, handles timing & DynamoDB updates
+├── jobs/                # User-defined jobs
+│   ├── __init__.py      # Auto-discovery module
+│   └── customer_orders.py
+└── lambda_dispatcher.py # Main AWS Lambda entrypoint
 ```
 
-### 5.1. Compute Isolation
-- **Process & Memory Isolation**: Each invocation spawns or reuses an isolated Lambda microVM container. State from Job A cannot leak into Job B.
-- **Horizontal Scaling**: AWS Lambda automatically scales up to the account's unreserved concurrency limit (default 1,000 concurrent executions).
+### 5.1. `ETLTask`
+The atomic unit of execution:
+```python
+class ETLTask(ABC):
+    name: str = "base_task"
+    max_retries: int = 2
+    backoff_seconds: float = 1.0
 
-### 5.2. Zero Hot-Partitioning in DynamoDB
-- The DynamoDB tracking table uses `job_id` (UUID) as the **Partition Key** (`HASH`) and `timestamp` as the **Sort Key** (`RANGE`).
-- Because UUIDs are evenly distributed, concurrent writes never hit partition throttling.
-- Using `PAY_PER_REQUEST` (On-Demand Capacity) allows DynamoDB to scale from 0 to tens of thousands of requests per second instantly.
+    @abstractmethod
+    def execute(self, context: ETLContext) -> Dict[str, Any]:
+        """Executes task logic and returns updated context dictionary."""
+        pass
+```
 
-### 5.3. S3 Throughput Distribution
-- Intermediate task storage and final datasets are partitioned by job:
-  - `s3://etl-framework-raw-dev/raw/{job_id}/...`
-  - `s3://etl-framework-processed-dev/processed/{job_id}/...`
-- AWS S3 natively supports 3,500 PUT and 5,500 GET requests per second per prefix. Partitioning by `{job_id}` guarantees that concurrent jobs never bottleneck each other on object storage.
+### 5.2. `ETLJob` & `JobRegistry`
+Jobs define an ordered task list and register via a decorator:
+```python
+@register_job("customer_orders")
+class CustomerOrdersJob(ETLJob):
+    description = "Ingests customer orders, cleans currency, and calculates totals"
+    tasks = [
+        ExtractOrdersTask(),
+        CleanseOrdersTask(),
+        LoadSummaryTask()
+    ]
+```
+
+### 5.3. `ETLContext`
+Passed between tasks by the Step Functions state payload:
+- **`context.get(key)` / `context.set(key, value)`**: Inter-task in-memory state.
+- **`context.save_s3(key, data, bucket_type)`**: Serializes datasets to S3.
+- **`context.read_s3(key, bucket_type)`**: Loads datasets from S3.
+- **`context.record_metric(metric, value)`**: Audits metrics in DynamoDB.
 
 ---
 
-## 6. DynamoDB Audit Schema
+## 6. Horizontal Scaling & Concurrency Characteristics
 
-Each job execution creates and updates a record in DynamoDB:
+The combination of Step Functions, Lambda, S3, and DynamoDB forms a fully serverless, horizontally scaling data pipeline:
 
-| Attribute | Type | Description | Example |
-| :--- | :--- | :--- | :--- |
-| `job_id` | `S` (PK) | Unique run identifier | `job-8f92b1a0` |
-| `timestamp` | `S` (SK) | ISO-8601 creation time | `2026-11-07T22:30:00.000Z` |
-| `job_name` | `S` | Name of registered job | `customer_orders` |
-| `status` | `S` | Current status | `IN_PROGRESS`, `COMPLETED`, `FAILED` |
-| `duration_ms` | `N` | Total runtime in ms | `1420` |
-| `parameters` | `M` | Invocations parameters | `{"batch_size": 500}` |
-| `task_history` | `L` | Step-by-step task breakdown | `[{"task": "extract", "status": "COMPLETED", "duration_ms": 320}]` |
-| `metrics` | `M` | User-defined job metrics | `{"records_in": 500, "records_out": 492}` |
-| `error` | `M` | Error details (if failed) | `{"task": "cleanse", "type": "ValueError", "message": "..."}` |
-| `updated_at` | `S` | Last heartbeat/update | `2026-11-07T22:30:01.420Z` |
+| Dimension | Scaling Architecture | Limits & Capacity |
+| :--- | :--- | :--- |
+| **Workflow Orchestration** | Step Functions Standard Workflows | Up to **1,000,000+** open concurrent executions; **10,000** state transitions/sec |
+| **Compute Execution** | AWS Lambda auto-scaling | 1,000 concurrent executions (default soft limit, expandable to 10,000s) |
+| **State Storage (Audit)** | DynamoDB On-Demand (PK: `job_id`) | Auto-scales up to 40,000+ Write Request Units/sec; zero hot-partitions |
+| **Payload Storage** | S3 prefix partitioning (`{job_id}/`) | 3,500 PUT and 5,500 GET requests/sec per prefix |
+| **Intra-Job Parallelism** | Step Functions Distributed Map | Up to **10,000 concurrent Lambda workers** per single execution |
+
+### Best Practice: The 256 KB Payload Rule
+AWS Step Functions enforces a **256 KB hard limit** on the JSON state passed between steps.  
+Our framework adheres strictly to this rule:
+- **Data Payloads**: Saved to S3 (`raw/{job_id}/data.json`, `processed/{job_id}/data.json`).
+- **State Payload**: Only lightweight pointers (`job_id`, `raw_s3_key`, `processed_s3_key`, `record_count`) are passed through Step Functions.
 
 ---
 
-## 7. Future Evolution Path (When Scale Demands It)
+## 7. Rerun & Redrive Operational Playbook
 
-When workloads expand in the future, the design can be extended without breaking existing jobs:
+### 1-Click Management Console Redrive
+1. Open [app.localstack.cloud](https://app.localstack.cloud/) (or AWS Management Console) ➔ **Step Functions**.
+2. Click the failed execution (e.g. `exec-job-0623ef41`).
+3. The visual graph highlights the exact task that failed in **red**.
+4. Click the **"Redrive execution"** button in the console header.
+5. Step Functions re-executes **only from the failed state**, preserving all prior task inputs and outputs.
 
-1. **Downstream Rate Limiting (SQS Buffer)**:
-   If downstream APIs or databases have connection pools or rate limits, an SQS queue can be placed in front of the Lambda runner to throttle maximum concurrency (e.g. `maximum_concurrency: 20`).
-2. **Long-Running Compute (>15 Minutes)**:
-   Because job logic is decoupled into `ETLJob` and `ETLTask`, the exact same Python classes can be executed inside **AWS ECS Fargate** or **AWS Batch** for jobs that exceed the Lambda 15-minute timeout.
-3. **Directed Acyclic Graphs (DAGs)**:
-   The task list in `ETLJob` can evolve from a sequential array into a directed dependency graph if branching or parallel tasks inside a single job are required.
+### Programmatic CLI Invocation
+Trigger any registered job with custom parameters from the command line:
+```bash
+make test-etl
+# Or for a specific job:
+make run-job JOB=customer_orders PARAMS='{"limit": 500}'
+```
+
+List all available jobs discovered in the Lambda catalog:
+```bash
+make list-jobs
+```
+
+Query all historical job runs and statuses from DynamoDB:
+```bash
+make query-ddb
+```

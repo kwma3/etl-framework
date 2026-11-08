@@ -1,0 +1,140 @@
+{
+  "Comment": "Serverless ETL Pipeline orchestrated by Step Functions with Unified Task Dispatcher",
+  "StartAt": "ExtractTask",
+  "States": {
+    "ExtractTask": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_arn}",
+        "Payload": {
+          "job_name.$": "$.job_name",
+          "task_name": "extract",
+          "job_id.$": "$.job_id",
+          "parameters.$": "$.parameters",
+          "context.$": "$.context"
+        }
+      },
+      "ResultSelector": {
+        "statusCode.$": "$.Payload.statusCode",
+        "job_id.$": "$.Payload.job_id",
+        "job_name.$": "$.Payload.job_name",
+        "task_name.$": "$.Payload.task_name",
+        "parameters.$": "$.Payload.parameters",
+        "context.$": "$.Payload.context",
+        "metrics.$": "$.Payload.metrics"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "TransformTask"
+    },
+    "TransformTask": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_arn}",
+        "Payload": {
+          "job_name.$": "$.job_name",
+          "task_name": "transform",
+          "job_id.$": "$.job_id",
+          "parameters.$": "$.parameters",
+          "context.$": "$.context"
+        }
+      },
+      "ResultSelector": {
+        "statusCode.$": "$.Payload.statusCode",
+        "job_id.$": "$.Payload.job_id",
+        "job_name.$": "$.Payload.job_name",
+        "task_name.$": "$.Payload.task_name",
+        "parameters.$": "$.Payload.parameters",
+        "context.$": "$.Payload.context",
+        "metrics.$": "$.Payload.metrics"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "LoadTask"
+    },
+    "LoadTask": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_arn}",
+        "Payload": {
+          "job_name.$": "$.job_name",
+          "task_name": "load",
+          "job_id.$": "$.job_id",
+          "parameters.$": "$.parameters",
+          "context.$": "$.context",
+          "is_final": true
+        }
+      },
+      "ResultSelector": {
+        "statusCode.$": "$.Payload.statusCode",
+        "job_id.$": "$.Payload.job_id",
+        "job_name.$": "$.Payload.job_name",
+        "task_name.$": "$.Payload.task_name",
+        "context.$": "$.Payload.context",
+        "metrics.$": "$.Payload.metrics"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "End": true
+    },
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Cause": "ETL Task Execution Failed",
+      "Error": "ETLTaskExecutionError"
+    }
+  }
+}

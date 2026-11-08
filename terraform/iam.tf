@@ -99,9 +99,7 @@ resource "aws_iam_role_policy" "sfn_policy" {
           "lambda:InvokeFunction"
         ]
         Resource = [
-          aws_lambda_function.extract.arn,
-          aws_lambda_function.transform.arn,
-          aws_lambda_function.load.arn
+          aws_lambda_function.etl_dispatcher.arn
         ]
       }
     ]

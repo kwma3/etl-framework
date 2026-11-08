@@ -23,12 +23,15 @@ resource "aws_cloudwatch_event_target" "step_functions_target" {
 
   input_transformer {
     input_paths = {
-      job_id  = "$.detail.job_id"
-      records = "$.detail.records"
+      job_name   = "$.detail.job_name"
+      job_id     = "$.detail.job_id"
+      parameters = "$.detail.parameters"
     }
     input_template = jsonencode({
-      "job_id"  = "<job_id>"
-      "records" = "<records>"
+      "job_name"   = "<job_name>"
+      "job_id"     = "<job_id>"
+      "parameters" = "<parameters>"
+      "context"    = {}
     })
   }
 }

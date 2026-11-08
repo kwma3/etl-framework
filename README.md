@@ -16,39 +16,33 @@ A modular, serverless ETL framework designed for local development and testing o
                       +-------------------+
                       |   Step Functions  |
                       |  (State Machine)  |
-                      +----+---------+----+
-                           |         |
-         +-----------------+         +-----------------+
-         |                           |                 |
-         v                           v                 v
-+-----------------+         +-----------------+  +---------------+
-| Extract Lambda  |         |Transform Lambda |  |  Load Lambda  |
-+--------+--------+         +--------+--------+  +-------+-------+
-         |                           |                   |
-         v                           v                   v
-+-----------------+         +-----------------+  +---------------+
-|  S3 Raw Bucket  |         |  S3 Processed   |  | EventBridge / |
-| (JSON Landing)  |         | (Cleaned Data)  |  | DynamoDB Log  |
-+-----------------+         +-----------------+  +---------------+
-         \                           /                   /
-          \                         /                   /
-           +-----------------------+-------------------+
-                                   |
-                                   v
-                         +-------------------+
-                         | DynamoDB Metadata |
-                         | (Job Runs Table)  |
-                         +-------------------+
+                      +----+----+----+----+
+                           |    |    |
+        +------------------+    |    +------------------+
+        |                       |                       |
+        v (task=extract)        v (task=transform)      v (task=load)
+  +-----------------------------------------------------------+
+  |              Unified Task Dispatcher Lambda               |
+  |         (Framework Registry + Python ETL Jobs)            |
+  +-----------------------------+-----------------------------+
+                                |
+        +-----------------------+-----------------------+
+        |                       |                       |
+        v                       v                       v
++---------------+       +---------------+       +---------------+
+| S3 Raw Bucket |       | S3 Processed  |       | DynamoDB Table|
+| (JSON Landing)|       | (Cleaned Data)|       | (Run Tracking)|
++---------------+       +---------------+       +---------------+
 ```
 
 ### Components
 
-1. **EventBridge**: Ingests pipeline trigger events (`etl.trigger` / `StartETLJob`) and invokes the Step Functions workflow.
-2. **AWS Step Functions**: Coordinates execution across tasks:
-   - **Extract**: Fetches raw data batches and saves them to the Raw S3 bucket.
-   - **Transform**: Reads raw data, validates email format and transaction amounts, cleans schemas, and writes to Processed S3 bucket.
-   - **Load / Finalize**: Emits completion events and writes final execution status to DynamoDB.
-3. **AWS Lambda (Python 3.11)**: Lightweight, modular task workers (`src/lambdas/`).
+1. **AWS Step Functions**: Coordinates execution across tasks visually with native **1-Click Redrive** in the AWS / LocalStack web console:
+   - **ExtractTask**: Ingests raw data and writes to the Raw S3 bucket.
+   - **TransformTask**: Cleanses, filters, validates schemas, and writes to Processed S3 bucket.
+   - **LoadTask**: Computes summaries, updates DynamoDB to `COMPLETED`, and finalizes the job.
+2. **Unified Task Dispatcher Lambda**: Single Lambda function housing the job catalog (`JobRegistry`) and executing the specific task requested by Step Functions.
+3. **EventBridge**: Ingests trigger events (`etl.trigger` / `StartETLJob`) and launches Step Functions workflows.
 4. **Amazon S3**:
    - `etl-framework-raw-dev`: Landing bucket for raw input datasets.
    - `etl-framework-processed-dev`: Destination bucket for cleaned, transformed data.
@@ -63,21 +57,33 @@ A modular, serverless ETL framework designed for local development and testing o
 ```
 etl_framework/
 ├── docker-compose.yml       # LocalStack container configuration
-├── Makefile                 # Convenient developer lifecycle commands
+├── Makefile                 # Developer lifecycle commands (up, deploy, test-etl, list-jobs)
 ├── README.md                # Documentation and architectural guide
-├── requirements.txt         # Python dependencies for local scripts / testing
+├── requirements.txt         # boto3 & testing dependencies
+├── docs/
+│   └── architecture_design.md # Full design specifications & ASL reference
 ├── scripts/
 │   ├── setup.sh             # Starts LocalStack and provisions Terraform
-│   ├── trigger_etl.py       # End-to-end execution and validation runner
-│   ├── trigger_etl.sh       # Shell wrapper for trigger_etl.py
+│   ├── trigger_pipeline.py  # Step Functions execution & validation runner
+│   ├── query_dynamodb.py    # Formatted terminal viewer for DynamoDB records
 │   └── cleanup.sh           # Destroys Terraform state and stops LocalStack
 ├── src/
-│   └── lambdas/             # Python Lambda handlers
-│       ├── common/          # Shared LocalStack client utilities
-│       ├── extract/         # Raw data ingestion handler
-│       ├── transform/       # Cleaning, validation, transformation handler
-│       └── load/            # Final status update & notification handler
-└── terraform/               # Declarative IaC (AWS Provider configured for LocalStack)
+│   ├── framework/           # Core framework (base, context, registry, dispatcher)
+│   ├── jobs/                # Registered Python ETL jobs (customer_orders, etc.)
+│   └── lambda_dispatcher.py # Unified Lambda entrypoint
+└── terraform/               # Declarative IaC
+    ├── asl/
+    │   └── etl_pipeline.asl.json # Amazon States Language pipeline definition
+    ├── provider.tf
+    ├── variables.tf
+    ├── s3.tf
+    ├── dynamodb.tf
+    ├── iam.tf
+    ├── lambdas.tf           # Packages unified dispatcher Lambda
+    ├── step_functions.tf    # Loads ASL definition via templatefile
+    ├── eventbridge.tf
+    └── outputs.tf
+```
     ├── provider.tf
     ├── variables.tf
     ├── s3.tf
@@ -116,17 +122,30 @@ make deploy
 
 ### 2. Run and Verify an End-to-End ETL Job
 
-Execute the verification script to start a Step Functions execution, follow its status, and inspect DynamoDB and S3 outputs:
+Trigger a Step Functions execution and follow its status:
 
 ```bash
-./scripts/trigger_etl.sh
+make run-job JOB=customer_orders
 ```
 
-Or:
+Inspect the DynamoDB execution metadata:
 
 ```bash
-make test-etl
+make query-ddb
 ```
+
+Inspect the CloudWatch Monitoring Dashboard:
+
+```bash
+make view-dashboard
+```
+
+Launch the real-time visual web dashboard in your browser:
+
+```bash
+make dashboard
+```
+> Opens [http://localhost:8080](http://localhost:8080) with live auto-refresh, Step Functions execution feed, and 1-click job runners.
 
 ### 3. Cleanup
 
